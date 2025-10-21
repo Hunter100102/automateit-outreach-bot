@@ -2,12 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import sqlite3 from 'sqlite3';
 import dotenv from 'dotenv';
-import sgMail from '@sendgrid/mail';
+import nodemailer from 'nodemailer';
 
 dotenv.config();
 
 const db = new sqlite3.Database(path.join(process.cwd(), 'data', 'outreach.sqlite'));
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 function dbAll(sql, params=[]){
   return new Promise((resolve,reject)=>db.all(sql, params, (err,rows)=> err?reject(err):resolve(rows)));
@@ -29,10 +28,20 @@ function renderTemplate(html){
 }
 
 async function main(){
+  // Create SMTP transporter
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || '465', 10),
+    secure: (process.env.SMTP_SECURE || 'true') === 'true', // true for 465, false for 587
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+
   const htmlTemplate = fs.readFileSync(path.join(process.cwd(), 'templates', 'email.html'), 'utf-8');
   const emailHtmlBase = renderTemplate(htmlTemplate);
 
-  // get a small batch of unsent prospects that aren't in suppression
   const prospects = await dbAll(`
     SELECT p.email
     FROM prospects p
@@ -49,35 +58,37 @@ async function main(){
   }
 
   const logoPath = path.join(process.cwd(), 'templates', 'assets', 'logo.png');
-  const logoContent = fs.readFileSync(logoPath).toString('base64');
 
   for(const row of prospects){
     const email = row.email.toLowerCase();
     const html = emailHtmlBase.replaceAll('{{EMAIL}}', encodeURIComponent(email));
 
-    const msg = {
+    const mailOptions = {
       to: email,
-      from: { email: process.env.FROM_EMAIL, name: process.env.FROM_NAME || 'AutomateIT' },
+      from: { address: process.env.FROM_EMAIL, name: process.env.FROM_NAME || 'AutomateIT' },
       subject: 'Automation Implementation Help',
       html,
-      attachments: [{
-        content: logoContent,
-        filename: 'logo.png',
-        type: 'image/png',
-        disposition: 'inline',
-        content_id: 'logo'
-      }]
+      attachments: [
+        {
+          filename: 'logo.png',
+          path: logoPath,
+          cid: 'logo' // matches cid:logo in the template
+        }
+      ]
     };
 
     try{
-      const resp = await sgMail.send(msg);
-      await dbRun('INSERT INTO sends (prospect_email, sendgrid_msg_id, status) VALUES (?,?,?)', [email, (resp[0]?.headers?.['x-message-id']||''), 'sent']);
-      console.log('Sent to', email);
+      const info = await transporter.sendMail(mailOptions);
+      await dbRun('INSERT INTO sends (prospect_email, sendgrid_msg_id, status) VALUES (?,?,?)',
+        [email, info.messageId || '', 'sent']);
+      console.log('Sent to', email, info.messageId);
     }catch(e){
       console.error('Send failed for', email, e.message);
-      await dbRun('INSERT INTO sends (prospect_email, status, error) VALUES (?,?,?)', [email, 'error', e.message]);
+      await dbRun('INSERT INTO sends (prospect_email, status, error) VALUES (?,?,?)',
+        [email, 'error', e.message]);
     }
   }
+
   process.exit(0);
 }
 

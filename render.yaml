@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: automateit-outreach-web
+    env: node
+    plan: free
+    buildCommand: "npm install && npm run seed"
+    startCommand: "node src/server.js"
+    autoDeploy: true
+    envVars:
+      - key: BING_SEARCH_API_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: FROM_EMAIL
+        value: "william@automatingsolutions.com"
+      - key: FROM_NAME
+        value: "William Cody Hunter"
+      - key: PUBLIC_BASE_URL
+        # update this AFTER first deploy with the Render URL you get
+        value: "https://RENDER-URL"
+      - key: COMPANY_ADDRESS_1
+        value: ""
+      - key: COMPANY_ADDRESS_2
+        value: ""
+      - key: COMPANY_CITY
+        value: "Stone Mountain"
+      - key: COMPANY_STATE
+        value: "GA"
+      - key: COMPANY_ZIP
+        value: "30083"
+      - key: COMPANY_COUNTRY
+        value: "USA"
+      - key: CALENDLY_URL
+        value: "https://calendly.com/william-automatingsolutions/30min"
+      - key: REQUESTS_PER_MINUTE
+        value: "30"
+      - key: TARGET_LOCATIONS
+        value: "Atlanta, GA; Sandy Springs, GA; Tucker, GA; Decatur, GA; Roswell, GA"
+      - key: TARGET_INDUSTRIES
+        value: "moving company; salon; spa; HVAC; auto repair; cafe; contractor"
+      - key: SEARCH_KEYWORDS
+        value: "contact; team; leadership; about; owners; management; email"
+      - key: MAX_RESULTS_PER_QUERY
+        value: "15"
+      - key: MAX_PAGES_PER_DOMAIN
+        value: "3"
+
+  - type: cron
+    name: automateit-scrape
+    env: node
+    plan: free
+    schedule: "0 * * * *"  # hourly
+    buildCommand: "npm install && npm run seed"
+    startCommand: "node src/scrape.js"
+    envVars:
+      - fromService:
+          type: web
+          name: automateit-outreach-web
+
+  - type: cron
+    name: automateit-send
+    env: node
+    plan: free
+    schedule: "20 * * * *" # hourly, offset from scrape
+    buildCommand: "npm install && npm run seed"
+    startCommand: "node src/send.js"
+    envVars:
+      - fromService:
+          type: web
+          name: automateit-outreach-web
