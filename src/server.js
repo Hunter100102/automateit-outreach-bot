@@ -1,24 +1,31 @@
-// server.js
+// src/server.js
 import express from "express";
 import morgan from "morgan";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 import sqlite3 from "sqlite3";
-import fetch from "node-fetch";
 import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
-const app = express();
+// ESM-safe __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// --- Middleware
+// App
+const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ strict: true, limit: "1mb" }));
 app.use(morgan("tiny"));
 
-// --- SQLite (ensure DB & table exist)
-const dbPath = path.join(process.cwd(), "data", "outreach.sqlite");
+// Ensure data dir + DB
+const dataDir = path.join(process.cwd(), "data");
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+const dbPath = path.join(dataDir, "outreach.sqlite");
 const db = new sqlite3.Database(dbPath);
 db.serialize(() => {
   db.run(
@@ -30,32 +37,28 @@ db.serialize(() => {
   );
 });
 
-// --- Utils
+// Helpers
 const required = (name) => {
   const v = process.env[name];
-  if (!v || String(v).trim() === "") {
-    throw new Error(`Missing required env var: ${name}`);
-  }
+  if (!v || String(v).trim() === "") throw new Error(`Missing required env var: ${name}`);
   return v;
 };
+const mask = (s = "") => (s.length <= 8 ? "********" : `${s.slice(0, 4)}…${s.slice(-4)}`);
 
-const mask = (s = "") =>
-  s.length <= 8 ? "********" : `${s.slice(0, 4)}…${s.slice(-4)}`;
-
-// --- Health
+// Health
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
     env: {
       BRAVE_API_KEY: process.env.BRAVE_API_KEY ? mask(process.env.BRAVE_API_KEY) : null,
       SENDGRID_API_KEY: process.env.SENDGRID_API_KEY ? "set" : "unset",
-      SMTP_USER: process.env.SMTP_USER ? process.env.SMTP_USER : null,
+      SMTP_USER: process.env.SMTP_USER || null,
       NEVERBOUNCE_API_KEY: process.env.NEVERBOUNCE_API_KEY ? "set" : "unset",
     },
   })
 );
 
-// --- Unsubscribe (your original)
+// Unsubscribe (original behavior)
 app.get("/unsubscribe", (req, res) => {
   const email = (req.query.email || "").toLowerCase().trim();
   if (!email) return res.status(400).send("Missing email");
@@ -75,30 +78,28 @@ app.get("/unsubscribe", (req, res) => {
   );
 });
 
-// --- Search (Brave)
+// Brave Search (uses Node 20 global fetch)
 app.get("/search", async (req, res) => {
   try {
     const q = String(req.query.q || "site:example.com contact");
-    const token = required("BRAVE_API_KEY"); // throws if missing
+    const token = required("BRAVE_API_KEY");
 
     const url = new URL("https://api.search.brave.com/res/v1/web/search");
     url.searchParams.set("q", q);
     url.searchParams.set("country", process.env.SEARCH_COUNTRY || "US");
     url.searchParams.set("lang", process.env.SEARCH_LANG || "en");
 
-    const r = await fetch(url.toString(), {
-      headers: { "X-Subscription-Token": token },
-    });
-
-    const data = await r.json().catch(() => ({}));
+    const r = await fetch(url, { headers: { "X-Subscription-Token": token } });
+    const body = await r.json().catch(() => ({}));
 
     if (!r.ok) {
-      // Surface Brave’s error to help with debugging 401/422
-      return res.status(r.status).json({ ok: false, providerStatus: r.status, providerBody: data });
+      return res.status(r.status).json({
+        ok: false,
+        providerStatus: r.status,
+        providerBody: body,
+      });
     }
-
-    // Normalize a bit
-    const results = data?.web?.results ?? [];
+    const results = body?.web?.results ?? [];
     res.json({ ok: true, q, count: results.length, results });
   } catch (e) {
     console.error("SEARCH ERR:", e);
@@ -106,17 +107,14 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// --- Send (SendGrid) — uses sandbox by default if SENDGRID_SANDBOX=true
-if (process.env.SENDGRID_API_KEY) {
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-}
+// Send via SendGrid (sandbox by default)
+if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 app.post("/send", async (req, res) => {
   try {
     if (!process.env.SENDGRID_API_KEY) {
       return res.status(400).json({ ok: false, error: "SENDGRID_API_KEY is not set" });
     }
-
     const fromEmail = required("FROM_EMAIL");
     const fromName = process.env.FROM_NAME || "";
 
@@ -126,7 +124,6 @@ app.post("/send", async (req, res) => {
     }
 
     const sandbox = String(process.env.SENDGRID_SANDBOX || "true").toLowerCase() === "true";
-
     const [resp] = await sgMail.send({
       to,
       from: { email: fromEmail, name: fromName },
@@ -136,18 +133,14 @@ app.post("/send", async (req, res) => {
       mailSettings: sandbox ? { sandboxMode: { enable: true } } : undefined,
     });
 
-    return res.status(resp?.statusCode || 202).json({
-      ok: true,
-      sandbox,
-      statusCode: resp?.statusCode || 202,
-    });
+    res.status(resp?.statusCode || 202).json({ ok: true, sandbox, statusCode: resp?.statusCode || 202 });
   } catch (e) {
     console.error("SENDGRID ERR:", e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// --- Send via SMTP (Gmail App Password)
+// Send via SMTP (Gmail App Password)
 app.post("/send-smtp", async (req, res) => {
   try {
     const host = process.env.SMTP_HOST || "smtp.gmail.com";
@@ -185,7 +178,7 @@ app.post("/send-smtp", async (req, res) => {
   }
 });
 
-// --- NeverBounce single-check helper route
+// NeverBounce single-check
 app.get("/verify-email", async (req, res) => {
   try {
     const key = process.env.NEVERBOUNCE_API_KEY;
@@ -198,7 +191,7 @@ app.get("/verify-email", async (req, res) => {
     url.searchParams.set("key", key);
     url.searchParams.set("email", email);
 
-    const r = await fetch(url.toString());
+    const r = await fetch(url);
     const data = await r.json().catch(() => ({}));
     res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data });
   } catch (e) {
@@ -207,11 +200,11 @@ app.get("/verify-email", async (req, res) => {
   }
 });
 
-// --- 404 fallback
+// 404
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `Route not found: ${req.method} ${req.path}` });
 });
 
-// --- Start
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on", PORT));
